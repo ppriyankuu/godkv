@@ -137,11 +137,11 @@ func (s *Store) Get(key string) (*Entry, bool) {
 	return nil, false
 }
 
-// Deleted performs a "soft-delete"
+// Delete performs a "soft-delete"
 // (only changes the flag to true, and clears the value)
 // the operation is also written to the WAL to ensure the deletion
 // is replicable
-func (s *Store) Deleted(key string) error {
+func (s *Store) Delete(key string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
