@@ -167,7 +167,7 @@ func (n *Node) executeReadQuorum(nodes []string, req *QuorumRequest) ([]*QuorumR
 
 			var resp *QuorumResponse
 			if nodeAddr == n.config.Address {
-				// reads the avalue form the local store
+				// reads the value from the local store
 				if entry, exists := n.store.Get(req.Key); exists {
 					resp = &QuorumResponse{
 						Success: true,
