@@ -1,7 +1,11 @@
 # Distributed Key-Value Store
 
-A production-grade distributed KV store written in Go, implementing consistent
-hashing, quorum-based replication, vector clocks, and WAL-backed persistence.
+A production-grade distributed KV store written in Go, implementing:
+- Consistent hashing
+- Quorum-based replication
+- Vector clocks
+- WAL-backed persistence
+- Read repair
 
 ---
 
@@ -25,38 +29,34 @@ go run ./cmd/server --id node3 --addr :8082 --data-dir /tmp/kv \
     --peers node1=localhost:8080,node2=localhost:8081 --n 3 --w 2 --r 2
 
 # Use the CLI
-go run ./cmd/client put hello "world"           --server http://localhost:8080
-go run ./cmd/client get hello                   --server http://localhost:8080
-go run ./cmd/client delete hello                --server http://localhost:8080
-go run ./cmd/client cluster nodes               --server http://localhost:8080
+go run ./cmd/client put hello "world" --server http://localhost:8080
+go run ./cmd/client get hello --server http://localhost:8080
+go run ./cmd/client delete hello --server http://localhost:8080
+go run ./cmd/client cluster nodes --server http://localhost:8080
 ```
 
 ---
 
-## Architecture
+## Basic Architecture
 
 ```
-┌─────────────────────────────────────────────────────────────────┐
-│  Client (CLI / Go library)                                      │
-└──────────────────────────┬──────────────────────────────────────┘
-                           │ HTTP
-            ┌──────────────▼──────────────┐
-            │   Coordinator Node          │
-            │   ┌─────────────────────┐   │
-            │   │  Gin HTTP Router    │   │
-            │   └────────┬────────────┘   │
-            │   ┌────────▼────────────┐   │
-            │   │   Replicator        │   │  ←── quorum, read repair
-            │   └────────┬────────────┘   │
-            │   ┌────────▼────────────┐   │
-            │   │   Store             │   │  ←── WAL + snapshot
-            │   └─────────────────────┘   │
-            └───────┬──────────┬──────────┘
-                    │          │   HTTP replication
-            ┌───────▼──┐  ┌────▼─────┐
-            │ Node 2   │  │ Node 3   │
-            └──────────┘  └──────────┘
+Client (CLI / Go library)
+          │ HTTP
+          ▼
+  Coordinator Node
+     ├── Gin Router
+     ├── Replicator (quorum + repair)
+     └── Store (WAL + snapshot)
+          │
+          ▼
+   Replica Nodes
 ```
+
+Each request is handled by a **coordinator** node, which:
+1. Determines replica nodes using consistent hashing.
+2. Executes quorum read/write logic.
+3. Stores data locally using WAL-backed persistence.
+4. Performs read repair when inconsistencies are detected.
 
 ---
 
@@ -210,16 +210,3 @@ in `cmd/server/main.go`, and also on graceful shutdown.
 | `GET` | `/health` | Health check |
 | `POST` | `/internal/replicate` | Peer replication endpoint |
 | `GET` | `/internal/fetch/:key` | Peer raw-fetch endpoint (for read repair) |
-
----
-
-## Trade-offs & Known Limitations
-
-| Area | Current choice | Production alternative |
-|---|---|---|
-| Membership | Static config | Gossip protocol (Serf/SWIM) |
-| Conflict resolution | Wall-clock LWW | CRDT or application-level merge |
-| WAL format | NDJSON | Binary (Protobuf/MessagePack) for speed |
-| Replication | Synchronous HTTP | Async WAL streaming (Raft log shipping) |
-| Failure detection | None | Heartbeats + suspect/dead state machine |
-| Security | None | mTLS between nodes, token auth for clients |
