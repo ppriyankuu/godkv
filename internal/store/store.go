@@ -1,20 +1,27 @@
-// Package store implements the core storage engine: an in-memory key-value
-// store backed by a Write-Ahead Log (WAL) for crash safety and periodic
-// snapshots for fast recovery.
+// Package store contains the core storage engine of our distributed key-value system.
 //
-// How it works (interview-ready explanation):
+// This store:
+//   - Keeps data in memory (fast reads/writes)
+//   - Persists every write to disk using a Write-Ahead Log (WAL)
+//   - Periodically creates full snapshots to speed up recovery
 //
-//  1. All writes go to the WAL first (disk) before being applied in-memory.
-//     If the process crashes mid-write, on restart we replay the WAL to
-//     reconstruct state — this is the same technique used by PostgreSQL/MySQL.
+// Big idea:
 //
-//  2. Snapshots periodically capture the full in-memory state to disk so
-//     WAL replay starts from the snapshot, not from the beginning of time.
-//     Without snapshots the WAL would grow unbounded and recovery would be slow.
+//  1. WAL (Write-Ahead Log)
+//     Every write is first written to disk before updating memory.
+//     If the process crashes, we replay the WAL to rebuild the state.
+//     This is how real databases like PostgreSQL and MySQL stay safe.
 //
-//  3. sync.RWMutex gives us concurrent reads (multiple goroutines can hold
-//     RLock simultaneously) while serialising writes (Lock is exclusive).
-//     This is the standard Go pattern for a read-heavy cache.
+//  2. Snapshot
+//     Instead of replaying the entire WAL from the beginning of time,
+//     we sometimes save the full in-memory state to disk.
+//     After that, we only need to replay newer WAL entries.
+//
+//  3. Concurrency
+//     We use sync.RWMutex so:
+//     - Many readers can read at the same time
+//     - Only one writer can write at a time
+//     This pattern works well for read-heavy systems.
 package store
 
 import (
@@ -26,15 +33,35 @@ import (
 	"time"
 )
 
-// Value wraps a stored value with metadata needed for distributed consistency.
+// Value represents one stored record in the key-value store.
+//
+// It contains:
+//   - The actual data
+//   - A vector clock (used to detect version conflicts between nodes)
+//   - A tombstone flag (used for soft deletes in distributed replication)
+//   - A timestamp for tie-breaking conflicts
+//
+// Why tombstone?
+// In distributed systems, deletes must also be replicated.
+// If we just removed the key, other nodes would not know it was deleted.
+// So we mark it as deleted instead.
 type Value struct {
 	Data      string      `json:"data"`
-	Clock     VectorClock `json:"clock"`     // version vector for conflict detection
-	Tombstone bool        `json:"tombstone"` // soft-delete marker (needed so deletes replicate)
-	UpdatedAt time.Time   `json:"updated_at"`
+	Clock     VectorClock `json:"clock"`      // Version information for conflict detection
+	Tombstone bool        `json:"tombstone"`  // Marks a soft delete
+	UpdatedAt time.Time   `json:"updated_at"` // Used as tie-breaker in conflicts
 }
 
-// Store is the primary storage abstraction.  It is safe for concurrent use.
+// Store is the main storage object.
+//
+// It is safe for concurrent use.
+//
+// Fields:
+//   - mu: mutex to protect access to the map
+//   - data: in-memory key-value storage
+//   - wal: write-ahead log for durability
+//   - dataDir: folder where snapshot and WAL are stored
+//   - nodeID: unique ID of this node (used in vector clocks)
 type Store struct {
 	mu      sync.RWMutex
 	data    map[string]Value
@@ -43,8 +70,16 @@ type Store struct {
 	nodeID  string
 }
 
-// New opens (or creates) a store rooted at dataDir.
-// On first open it replays any existing WAL entries on top of the last snapshot.
+// New creates or opens a Store.
+//
+// Startup process:
+//
+// 1) Create the data directory (if it doesn't exist)
+// 2) Load the latest snapshot into memory
+// 3) Open the WAL file
+// 4) Replay WAL entries written after the snapshot
+//
+// After this finishes, the store is fully rebuilt in memory.
 func New(dataDir, nodeID string) (*Store, error) {
 	if err := os.MkdirAll(dataDir, 0755); err != nil {
 		return nil, fmt.Errorf("create data dir: %w", err)
@@ -77,8 +112,18 @@ func New(dataDir, nodeID string) (*Store, error) {
 
 // ─── Public API ───────────────────────────────────────────────────────────────
 
-// Put stores a value.  The caller supplies a VectorClock; if nil a fresh one
-// is created stamped with nodeID.
+// Put stores or updates a key.
+//
+// Steps:
+//  1. Lock for writing
+//  2. Increment this node's vector clock
+//  3. Write the operation to the WAL (disk first!)
+//  4. Update the in-memory map
+//
+// Important rule:
+//
+//	We ALWAYS write to WAL before changing memory.
+//	This guarantees crash safety.
 func (s *Store) Put(key, data string, clock VectorClock) (Value, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -105,7 +150,13 @@ func (s *Store) Put(key, data string, clock VectorClock) (Value, error) {
 	return v, nil
 }
 
-// Get returns the value for key.  Returns (Value{}, false) if not found or deleted.
+// Get returns the value for a key.
+//
+// If the key does not exist OR
+// if it was deleted (tombstone),
+// it returns (Value{}, false).
+//
+// This hides tombstones from normal reads.
 func (s *Store) Get(key string) (Value, bool) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -117,8 +168,11 @@ func (s *Store) Get(key string) (Value, bool) {
 	return v, true
 }
 
-// GetRaw returns the raw Value including tombstones — used internally for
-// replication and read repair so we can propagate deletes.
+// GetRaw returns the stored Value exactly as it exists,
+// including tombstones.
+//
+// This is used internally for replication so that
+// deletes can be propagated across nodes.
 func (s *Store) GetRaw(key string) (Value, bool) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -126,8 +180,19 @@ func (s *Store) GetRaw(key string) (Value, bool) {
 	return v, ok
 }
 
-// Delete soft-deletes a key by writing a tombstone.  The tombstone is
-// replicated to followers so they also remove the key.
+// Delete performs a soft delete.
+//
+// Instead of removing the key from memory,
+// we store a new Value with Tombstone = true.
+//
+// Why?
+// Because deletes must also replicate to other nodes.
+// A tombstone tells other replicas: "this key was deleted".
+//
+// Just like Put:
+//   - We increment vector clock
+//   - We write to WAL first
+//   - Then update memory
 func (s *Store) Delete(key string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -154,9 +219,23 @@ func (s *Store) Delete(key string) error {
 	return nil
 }
 
-// ApplyRemote applies a value received from a peer during replication.
-// It uses the vector clock to decide whether to accept or discard the update.
-// This is the core of "last-write-wins with vector clocks."
+// ApplyRemote applies an update received from another node.
+//
+// This is part of replication.
+//
+// We compare vector clocks to decide:
+//
+//   - If incoming is older → ignore it
+//   - If incoming is newer → accept it
+//   - If both are concurrent (true conflict):
+//     use UpdatedAt as a tie-breaker
+//
+// This approach is:
+//
+//	"Vector clocks for causality + last-write-wins for conflicts"
+//
+// In a real production system, we might return conflicts
+// to the application instead of auto-resolving.
 func (s *Store) ApplyRemote(key string, incoming Value) (applied bool, err error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -166,10 +245,6 @@ func (s *Store) ApplyRemote(key string, incoming Value) (applied bool, err error
 		rel := incoming.Clock.Compare(existing.Clock)
 		switch rel {
 		case ConcurrentClocks:
-			// True conflict: both clocks are incomparable.  We merge by taking
-			// the later wall-clock time as a tiebreaker — a pragmatic choice
-			// used by many real systems (Cassandra, Riak).  A production system
-			// could surface the conflict to the application instead.
 			if incoming.UpdatedAt.Before(existing.UpdatedAt) {
 				return false, nil // keep existing
 			}
@@ -188,7 +263,9 @@ func (s *Store) ApplyRemote(key string, incoming Value) (applied bool, err error
 	return true, nil
 }
 
-// Keys returns a snapshot of all live (non-tombstoned) keys.
+// Keys returns all keys that are NOT tombstoned.
+//
+// We do not expose deleted keys to users.
 func (s *Store) Keys() []string {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -204,8 +281,20 @@ func (s *Store) Keys() []string {
 
 // ─── Snapshot ─────────────────────────────────────────────────────────────────
 
-// Snapshot serialises the current in-memory state to disk and truncates the
-// WAL.  Call this periodically (e.g. every N writes or on a timer).
+// Snapshot saves the entire in-memory state to disk.
+//
+// Steps:
+//  1. Copy in-memory map (while holding read lock)
+//  2. Write it to a temporary file
+//  3. Atomically rename it to snapshot.json
+//  4. Truncate the WAL (since snapshot now contains everything)
+//
+// Why atomic rename?
+// If we crash during write, the old snapshot remains safe.
+//
+// After snapshot:
+//
+//	Recovery is much faster because we replay fewer WAL entries.
 func (s *Store) Snapshot() error {
 	s.mu.RLock()
 	snapshot := make(map[string]Value, len(s.data))
@@ -237,6 +326,10 @@ func (s *Store) Snapshot() error {
 	return s.wal.truncate()
 }
 
+// loadSnapshot loads snapshot.json (if it exists)
+// and restores it into memory.
+//
+// If no snapshot exists, this is not an error.
 func (s *Store) loadSnapshot() error {
 	path := filepath.Join(s.dataDir, "snapshot.json")
 	f, err := os.Open(path)
@@ -256,6 +349,12 @@ func (s *Store) loadSnapshot() error {
 	return nil
 }
 
+// replayWAL reads all WAL entries
+// and applies them to the in-memory map.
+//
+// Important:
+// We DO NOT re-write them to the WAL again.
+// We are only rebuilding memory.
 func (s *Store) replayWAL() error {
 	entries, err := s.wal.readAll()
 	if err != nil {
@@ -268,7 +367,8 @@ func (s *Store) replayWAL() error {
 	return nil
 }
 
-// Close flushes everything and closes underlying files.
+// Close closes the WAL file.
+// Call this during shutdown.
 func (s *Store) Close() error {
 	return s.wal.close()
 }

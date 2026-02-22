@@ -1,5 +1,28 @@
-// Package client provides a Go library for interacting with the KV store.
-// It is used by both the CLI and can be imported by other Go services.
+// Package client provides a Go SDK for talking to the distributed KV store.
+//
+// Big idea:
+//
+// Instead of writing raw HTTP requests everywhere,
+// we wrap them inside a clean Go API.
+//
+// So instead of:
+//
+//	http.NewRequest(...)
+//	json.Marshal(...)
+//
+// Users can simply call:
+//
+//	client.Put(ctx, "key", "value")
+//	client.Get(ctx, "key")
+//
+// This is called a "client library" or "SDK".
+//
+// It hides:
+//   - HTTP details
+//   - JSON encoding/decoding
+//   - Error handling
+//
+// And exposes a clean Go interface.
 package client
 
 import (
@@ -12,14 +35,32 @@ import (
 	"time"
 )
 
-// Client talks to a single node of the KV store.  For production use you
-// would add a retry layer that automatically re-routes to a healthy node.
+// Client represents a connection to ONE KV node.
+//
+// Important:
+//
+// This client talks to a single node.
+// That node is responsible for:
+//   - Coordinating replication
+//   - Talking to other nodes
+//
+// So the client does NOT implement distributed logic.
+// It just talks to one node.
 type Client struct {
 	baseURL    string
 	httpClient *http.Client
 }
 
-// New creates a Client pointed at baseURL (e.g. "http://localhost:8080").
+// New creates a new Client.
+//
+// baseURL example:
+//
+//	"http://localhost:8080"
+//
+// timeout protects us from hanging forever.
+// In distributed systems:
+//
+//	NEVER call network without timeout.
 func New(baseURL string, timeout time.Duration) *Client {
 	if timeout == 0 {
 		timeout = 10 * time.Second
@@ -30,14 +71,26 @@ func New(baseURL string, timeout time.Duration) *Client {
 	}
 }
 
-// PutResponse is returned from Put operations.
+// PutResponse is returned after a successful write.
+//
+// Why return a clock?
+//
+// Because this is a distributed system.
+// Each write updates a vector clock.
+// The client may need that for debugging or conflict handling.
 type PutResponse struct {
 	Key   string            `json:"key"`
 	Value string            `json:"value"`
 	Clock map[string]uint64 `json:"clock"`
 }
 
-// GetResponse is returned from Get operations.
+// GetResponse includes:
+//
+//   - The value
+//   - Its vector clock
+//   - The last update time
+//
+// This gives full version information.
 type GetResponse struct {
 	Key       string            `json:"key"`
 	Value     string            `json:"value"`
@@ -45,7 +98,18 @@ type GetResponse struct {
 	UpdatedAt time.Time         `json:"updated_at"`
 }
 
-// Put stores key=value.  Returns the stored value with its vector clock.
+// Put stores key=value in the cluster.
+//
+// Flow:
+//
+//  1. Create JSON body
+//  2. Build HTTP PUT request
+//  3. Send request
+//  4. Check status
+//  5. Decode response
+//
+// The distributed logic happens inside the server.
+// This client only performs the HTTP call.
 func (c *Client) Put(ctx context.Context, key, value string) (*PutResponse, error) {
 	body, _ := json.Marshal(map[string]string{"value": value})
 
@@ -70,7 +134,12 @@ func (c *Client) Put(ctx context.Context, key, value string) (*PutResponse, erro
 	return &result, json.NewDecoder(resp.Body).Decode(&result)
 }
 
-// Get retrieves the value for key.  Returns ErrNotFound if the key does not exist.
+// Get retrieves value for key.
+//
+// Special case:
+//
+//	If server returns 404
+//	We convert it into ErrNotFound
 func (c *Client) Get(ctx context.Context, key string) (*GetResponse, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet,
 		fmt.Sprintf("%s/kv/%s", c.baseURL, key), nil)
@@ -95,7 +164,14 @@ func (c *Client) Get(ctx context.Context, key string) (*GetResponse, error) {
 	return &result, json.NewDecoder(resp.Body).Decode(&result)
 }
 
-// Delete removes key from the store.
+// Delete removes key from cluster.
+//
+// Internally server may:
+//   - Create tombstone
+//   - Replicate deletion
+//
+// Client doesn't care.
+// It just sends DELETE request.
 func (c *Client) Delete(ctx context.Context, key string) error {
 	req, err := http.NewRequestWithContext(ctx, http.MethodDelete,
 		fmt.Sprintf("%s/kv/%s", c.baseURL, key), nil)
@@ -112,7 +188,12 @@ func (c *Client) Delete(ctx context.Context, key string) error {
 	return checkStatus(resp)
 }
 
-// JoinCluster registers a new node with the cluster.
+// JoinCluster registers a node into the cluster.
+//
+// This triggers:
+//   - Membership update
+//   - Hash ring update
+//   - Key redistribution
 func (c *Client) JoinCluster(ctx context.Context, nodeID, address string) error {
 	body, _ := json.Marshal(map[string]string{"id": nodeID, "address": address})
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost,
@@ -161,6 +242,15 @@ func (e *APIError) Error() string {
 	return fmt.Sprintf("HTTP %d: %s", e.Status, e.Message)
 }
 
+// checkStatus converts HTTP error responses
+// into Go errors.
+//
+// If status is 2xx → success.
+// Otherwise:
+//
+//  1. Read response body
+//  2. Try parsing {"error": "..."} JSON
+//  3. Return APIError
 func checkStatus(resp *http.Response) error {
 	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
 		return nil

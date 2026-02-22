@@ -7,35 +7,69 @@ import (
 	"sync"
 )
 
-// The WAL (Write-Ahead Log) is an append-only file where every mutation is
-// durably recorded BEFORE it is applied to the in-memory store.
+// WAL (Write-Ahead Log)
 //
-// Interview explanation:
-//   WALs are the backbone of crash safety in databases.  Because writes are
-//   sequential (append-only), they are very fast even on spinning disks.
-//   On restart we read the WAL from top to bottom and re-apply every entry,
-//   leaving the store in the exact state it was before the crash.
+// The WAL is a file where we record every change BEFORE
+// we update the in-memory map.
+//
+// Why?
+// If the process crashes, memory is lost.
+// But the WAL file stays on disk.
+//
+// When the server restarts:
+//   1) We read the snapshot (if any)
+//   2) Then replay all WAL entries
+//   3) The store becomes exactly what it was before the crash
+//
+// Important idea:
+// The WAL is append-only.
+// We only add to the end of the file.
+// This is fast because disks are very good at sequential writes.
+//
+// This is the same basic idea used by real databases.
 
+// These define the type of operation stored in the WAL.
 const (
 	opPut    = "PUT"
 	opDelete = "DELETE"
 )
 
+// walEntry represents one line in the WAL file.
+//
+// Each entry stores:
+//   - The operation (PUT or DELETE)
+//   - The key
+//   - The full Value (including vector clock and tombstone)
+//
+// We store the full Value so recovery is simple.
+// During replay we just restore it directly into memory.
 type walEntry struct {
 	Op    string `json:"op"`
 	Key   string `json:"key"`
 	Value Value  `json:"value"`
 }
 
-// WAL is a simple append-only log backed by a single file.
-// Each entry is a newline-delimited JSON object (NDJSON) which makes it
-// trivial to read back line-by-line.
+// WAL represents the write-ahead log file.
+//
+// Fields:
+//   - mu: ensures only one goroutine writes at a time
+//   - file: the open file handle
+//   - path: file location (used for truncate/reopen logic)
 type WAL struct {
 	mu   sync.Mutex
 	file *os.File
 	path string
 }
 
+// newWAL opens (or creates) the WAL file.
+//
+// Flags:
+//
+//	O_CREATE → create file if it does not exist
+//	O_RDWR   → open for read and write
+//	O_APPEND → always write at the end of file
+//
+// We use O_APPEND to guarantee we never overwrite old entries.
 func newWAL(path string) (*WAL, error) {
 	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR|os.O_APPEND, 0644)
 	if err != nil {
@@ -44,9 +78,24 @@ func newWAL(path string) (*WAL, error) {
 	return &WAL{file: f, path: path}, nil
 }
 
-// append serialises entry as JSON and fsync-writes it.
-// fsync (Sync) forces the OS to flush its write buffer to physical media —
-// without it a crash could lose the entry even though Write returned nil.
+// append writes a new entry to the WAL.
+//
+// Steps:
+//  1. Lock (only one writer allowed)
+//  2. Convert entry to JSON
+//  3. Add newline (so each entry is one line)
+//  4. Write to file
+//  5. Call Sync() to flush to disk
+//
+// Why Sync() is important:
+//
+//	Write() only writes to OS buffer.
+//	Sync() forces the OS to flush data to physical disk.
+//
+// Without Sync(), a sudden crash (power loss)
+// could lose the last write even though Write() succeeded.
+//
+// This is what makes the WAL durable.
 func (w *WAL) append(entry walEntry) error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
@@ -60,39 +109,65 @@ func (w *WAL) append(entry walEntry) error {
 	if _, err := w.file.Write(data); err != nil {
 		return err
 	}
-	return w.file.Sync() // flush to disk — this is the "D" in ACID
+	return w.file.Sync() // ensures data is physically written to disk
 }
 
-// readAll scans the WAL file from the beginning and returns all entries.
+// readAll reads the entire WAL file from the beginning.
+//
+// Used during startup to replay operations.
+//
+// Steps:
+//  1. Seek to beginning of file
+//  2. Read line by line
+//  3. Parse each JSON line
+//  4. Return all entries in order
+//
+// Important:
+// Entries must be applied in the same order they were written.
+// Order matters because later writes override earlier ones.
 func (w *WAL) readAll() ([]walEntry, error) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 
-	// Seek to start for reading.
+	// Move file pointer to beginning before reading.
 	if _, err := w.file.Seek(0, 0); err != nil {
 		return nil, err
 	}
 
 	var entries []walEntry
 	scanner := bufio.NewScanner(w.file)
+
 	for scanner.Scan() {
 		line := scanner.Bytes()
 		if len(line) == 0 {
 			continue
 		}
+
 		var e walEntry
 		if err := json.Unmarshal(line, &e); err != nil {
-			// Corrupt entry — skip it.  In a production system we'd stop here
-			// and alert an operator rather than silently skip.
+			// If one line is corrupted, we skip it.
+			// In a real production system, we would likely stop
+			// and raise an alert instead of silently skipping.
 			continue
 		}
 		entries = append(entries, e)
 	}
+
 	return entries, scanner.Err()
 }
 
-// truncate empties the WAL after a snapshot has been taken.
-// We use O_TRUNC rather than deleting because re-opening is simpler.
+// truncate clears the WAL file.
+//
+// When do we call this?
+// After taking a snapshot.
+//
+// Why?
+// Because the snapshot already contains all data.
+// So old WAL entries are no longer needed.
+//
+// Instead of deleting the file,
+// we truncate it (set size to 0).
+// This keeps the file handle open and simplifies logic.
 func (w *WAL) truncate() error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
@@ -100,10 +175,14 @@ func (w *WAL) truncate() error {
 	if err := w.file.Truncate(0); err != nil {
 		return err
 	}
+
+	// Move file pointer back to start.
 	_, err := w.file.Seek(0, 0)
 	return err
 }
 
+// close closes the WAL file.
+// Should be called during graceful shutdown.
 func (w *WAL) close() error {
 	return w.file.Close()
 }

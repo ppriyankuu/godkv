@@ -12,36 +12,54 @@ import (
 	"time"
 )
 
-// Replicator handles all inter-node communication for reads and writes.
-//
-// Interview explanation — Quorum reads/writes:
-//
-//   With N replicas, W write-quorum, and R read-quorum we ensure strong
-//   consistency as long as W + R > N.  Classic choice: N=3, W=2, R=2.
-//
-//   Write path:
-//     1. Client sends PUT to the coordinator node.
-//     2. Coordinator writes locally.
-//     3. Coordinator fans out to all N-1 peers in parallel.
-//     4. Once W-1 peers acknowledge (W total including self), return success.
-//     5. Remaining peers are updated asynchronously ("hinted handoff").
-//
-//   Read path:
-//     1. Coordinator asks R replicas for the value.
-//     2. Compares versions using vector clocks.
-//     3. Returns the most recent version.
-//     4. If stale replicas are detected, triggers read repair (async write-back).
-//
-//   This tolerates up to N-W write failures and N-R read failures.
+////////////////////////////////////////////////////////////////////////////////
+// REPLICATOR
+////////////////////////////////////////////////////////////////////////////////
 
-// ReplicaResponse is the result of contacting a single replica.
+// Replicator handles communication between nodes.
+//
+// In a distributed system, one node acts as the coordinator
+// for a request. That node must:
+//
+//   • Write locally
+//   • Send the write to other replicas
+//   • Wait for enough acknowledgements (quorum)
+//   • Return success or failure
+//
+// This struct implements quorum reads and quorum writes.
+//
+// -----------------------------------------------------------------------------
+// QUORUM THEORY (Interview explanation)
+//
+// If:
+//   N = total replicas
+//   W = write quorum
+//   R = read quorum
+//
+// To guarantee strong consistency:
+//
+//      W + R > N
+//
+// Example:
+//   N = 3
+//   W = 2
+//   R = 2
+//
+// That means:
+//   - A write must succeed on at least 2 nodes.
+//   - A read must consult at least 2 nodes.
+//   - There will always be overlap between read & write nodes.
+//
+////////////////////////////////////////////////////////////////////////////////
+
+// ReplicaResponse represents the result from contacting one replica.
 type ReplicaResponse struct {
 	NodeID string
 	Value  *store.Value
 	Err    error
 }
 
-// Replicator fans writes and reads out to replica nodes.
+// Replicator fans reads and writes to replica nodes.
 type Replicator struct {
 	selfID     string
 	membership *Membership
@@ -49,12 +67,17 @@ type Replicator struct {
 	httpClient *http.Client
 
 	// Quorum parameters
-	N int // replication factor
+	N int // total replicas per key
 	W int // write quorum
 	R int // read quorum
 }
 
-// NewReplicator creates a Replicator.  N, W, R must satisfy W+R > N for strong consistency.
+// NewReplicator creates a new replicator.
+//
+// IMPORTANT:
+// For strong consistency, caller must ensure:
+//
+//	W + R > N
 func NewReplicator(selfID string, m *Membership, s *store.Store, n, w, r int) *Replicator {
 	return &Replicator{
 		selfID:     selfID,
@@ -67,16 +90,31 @@ func NewReplicator(selfID string, m *Membership, s *store.Store, n, w, r int) *R
 	}
 }
 
-// ─── Write path ───────────────────────────────────────────────────────────────
+////////////////////////////////////////////////////////////////////////////////
+// WRITE PATH
+////////////////////////////////////////////////////////////////////////////////
 
-// ReplicateWrite writes to W nodes and returns the final stored Value.
+// ReplicateWrite performs a quorum write.
+//
+// Steps:
+//
+// 1) Write locally first (coordinator always participates).
+// 2) Find replica nodes using consistent hashing.
+// 3) Send write to peers in parallel.
+// 4) Wait until W acknowledgements are received.
+// 5) If quorum reached → success.
+// 6) If timeout or insufficient acks → failure.
+//
+// Self always counts as 1 acknowledgement.
 func (rep *Replicator) ReplicateWrite(key, data string, clock store.VectorClock) (store.Value, error) {
-	// Write locally first — coordinator always participates.
+
+	// Step 1: Write locally.
 	val, err := rep.store.Put(key, data, clock)
 	if err != nil {
 		return store.Value{}, fmt.Errorf("local write: %w", err)
 	}
 
+	// Step 2: Determine replicas.
 	replicas := rep.membership.ReplicaNodes(key, rep.N)
 	peers := rep.peersOnly(replicas) // exclude self
 
@@ -86,6 +124,7 @@ func (rep *Replicator) ReplicateWrite(key, data string, clock store.VectorClock)
 	}
 	results := make(chan result, len(peers))
 
+	// Step 3: Send writes in parallel.
 	for _, peer := range peers {
 		go func(p *Node) {
 			err := rep.sendReplicateRequest(p, key, val)
@@ -93,8 +132,8 @@ func (rep *Replicator) ReplicateWrite(key, data string, clock store.VectorClock)
 		}(peer)
 	}
 
-	// Collect until we reach write quorum (W-1 peers since we already have self).
-	acks := 1 // self counts as one ack
+	// Step 4: Wait for quorum.
+	acks := 1 // self already acknowledged
 	required := rep.W
 	var errs []error
 
@@ -127,18 +166,32 @@ func (rep *Replicator) ReplicateWrite(key, data string, clock store.VectorClock)
 	return store.Value{}, fmt.Errorf("write quorum not met (%d/%d), errors: %v", acks, required, errs)
 }
 
-// ─── Read path ────────────────────────────────────────────────────────────────
+////////////////////////////////////////////////////////////////////////////////
+// READ PATH
+////////////////////////////////////////////////////////////////////////////////
 
-// CoordinateRead fetches from R replicas, reconciles versions, and performs
-// async read repair on any stale replicas.
+// CoordinateRead performs a quorum read.
+//
+// Steps:
+//
+// 1) Identify N replica nodes.
+// 2) Ask all replicas in parallel.
+// 3) Wait for R responses.
+// 4) Compare versions using vector clocks.
+// 5) Return the newest value.
+// 6) If stale replicas detected → trigger read repair.
+//
+// Read repair keeps replicas eventually consistent.
 func (rep *Replicator) CoordinateRead(key string) (*store.Value, error) {
-	replicas := rep.membership.ReplicaNodes(key, rep.N)
 
+	replicas := rep.membership.ReplicaNodes(key, rep.N)
 	responses := make(chan ReplicaResponse, len(replicas))
 
+	// Step 1 & 2: Query replicas in parallel.
 	for _, node := range replicas {
 		go func(n *Node) {
 			if n.ID == rep.selfID {
+				// Local read.
 				v, ok := rep.store.GetRaw(key)
 				if !ok {
 					responses <- ReplicaResponse{NodeID: n.ID, Value: nil}
@@ -146,13 +199,14 @@ func (rep *Replicator) CoordinateRead(key string) (*store.Value, error) {
 				}
 				responses <- ReplicaResponse{NodeID: n.ID, Value: &v}
 			} else {
+				// Remote read.
 				v, err := rep.fetchFromPeer(n, key)
 				responses <- ReplicaResponse{NodeID: n.ID, Value: v, Err: err}
 			}
 		}(node)
 	}
 
-	// Gather R responses.
+	// Step 3: Wait for R responses.
 	var collected []ReplicaResponse
 	timeout := time.After(5 * time.Second)
 	required := rep.R
@@ -169,16 +223,17 @@ func (rep *Replicator) CoordinateRead(key string) (*store.Value, error) {
 		}
 	}
 
-	// Reconcile: find the most recent version by vector clock comparison.
+	// Step 4: Reconcile versions.
 	winner, stale := reconcile(collected)
+
 	if winner == nil {
-		return nil, nil // key not found on any replica
+		return nil, nil // not found
 	}
 	if winner.Tombstone {
 		return nil, nil // deleted
 	}
 
-	// Read repair: asynchronously bring stale replicas up to date.
+	// Step 6: Repair stale replicas asynchronously.
 	if len(stale) > 0 {
 		go rep.readRepair(key, *winner, stale)
 	}
@@ -186,7 +241,23 @@ func (rep *Replicator) CoordinateRead(key string) (*store.Value, error) {
 	return winner, nil
 }
 
-// reconcile picks the most recent Value and lists nodes that are behind.
+////////////////////////////////////////////////////////////////////////////////
+// VERSION RECONCILIATION
+////////////////////////////////////////////////////////////////////////////////
+
+// reconcile selects the newest value using vector clocks.
+//
+// Vector clock comparison:
+//
+//	After     → strictly newer
+//	Before    → strictly older
+//	Concurrent→ conflict
+//
+// If concurrent, we use wall-clock time as a tiebreaker.
+//
+// Returns:
+//   - The winning value
+//   - List of stale node IDs
 func reconcile(responses []ReplicaResponse) (winner *store.Value, staleNodes []string) {
 	for _, r := range responses {
 		if r.Err != nil || r.Value == nil {
@@ -197,14 +268,14 @@ func reconcile(responses []ReplicaResponse) (winner *store.Value, staleNodes []s
 			continue
 		}
 		rel := r.Value.Clock.Compare(winner.Clock)
+
 		switch rel {
 		case store.After:
-			staleNodes = append(staleNodes, "") // old winner is stale — but we don't track its node here
+			staleNodes = append(staleNodes, "")
 			winner = r.Value
 		case store.Before:
 			staleNodes = append(staleNodes, r.NodeID)
 		case store.ConcurrentClocks:
-			// Conflict: pick by wall clock as tiebreaker.
 			if r.Value.UpdatedAt.After(winner.UpdatedAt) {
 				winner = r.Value
 			} else {
@@ -215,38 +286,54 @@ func reconcile(responses []ReplicaResponse) (winner *store.Value, staleNodes []s
 	return winner, staleNodes
 }
 
-// readRepair writes the authoritative value back to stale nodes.
-// This is how eventual consistency "heals" itself without a background job.
+// readRepair fixes stale replicas.
+//
+// Instead of running a background anti-entropy job,
+// we repair during reads.
+//
+// This keeps replicas synchronized naturally.
 func (rep *Replicator) readRepair(key string, val store.Value, staleNodeIDs []string) {
 	for _, id := range staleNodeIDs {
 		node, ok := rep.membership.GetNode(id)
 		if !ok {
 			continue
 		}
-		_ = rep.sendReplicateRequest(node, key, val) // best-effort
+		_ = rep.sendReplicateRequest(node, key, val) // best effort
 	}
 }
 
-// ─── HTTP transport ───────────────────────────────────────────────────────────
+////////////////////////////////////////////////////////////////////////////////
+// HTTP TRANSPORT
+////////////////////////////////////////////////////////////////////////////////
 
-// ReplicateRequest is the wire format for replication messages.
+// ReplicateRequest is the JSON message sent between nodes.
 type ReplicateRequest struct {
 	Key   string      `json:"key"`
 	Value store.Value `json:"value"`
 }
 
-// sendReplicateRequest sends a value to a peer with exponential backoff retries.
+// sendReplicateRequest sends data to a peer.
 //
-// Why exponential backoff?  Thundering-herd prevention.  If a node is briefly
-// overloaded and all peers hammer it with retries simultaneously, each retry
-// makes the overload worse.  Exponential backoff with jitter spreads the load.
+// It uses exponential backoff:
+//
+//	Attempt 1 → immediate
+//	Attempt 2 → wait 100ms
+//	Attempt 3 → wait 200ms
+//	Attempt 4 → wait 400ms
+//
+// Why?
+// If a node is overloaded,
+// retrying instantly makes things worse.
+// Backoff reduces pressure.
 func (rep *Replicator) sendReplicateRequest(peer *Node, key string, val store.Value) error {
+
 	body := ReplicateRequest{Key: key, Value: val}
 
 	const maxRetries = 3
-	for attempt := 0; attempt < maxRetries; attempt++ {
+
+	for attempt := range maxRetries {
+
 		if attempt > 0 {
-			// Backoff: 100ms, 200ms, 400ms … with a cap.
 			delay := time.Duration(math.Pow(2, float64(attempt-1))*100) * time.Millisecond
 			time.Sleep(delay)
 		}
@@ -263,13 +350,16 @@ func (rep *Replicator) sendReplicateRequest(peer *Node, key string, val store.Va
 	return nil
 }
 
+// doHTTPReplicate performs the actual HTTP POST.
 func (rep *Replicator) doHTTPReplicate(peer *Node, body ReplicateRequest) error {
+
 	data, err := json.Marshal(body)
 	if err != nil {
 		return err
 	}
 
 	url := fmt.Sprintf("http://%s/internal/replicate", peer.Address)
+
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
 
@@ -291,9 +381,14 @@ func (rep *Replicator) doHTTPReplicate(peer *Node, body ReplicateRequest) error 
 	return nil
 }
 
-// fetchFromPeer GETs the raw value (including tombstones) from a peer node.
+// fetchFromPeer retrieves a value from another node.
+//
+// We fetch raw values including tombstones
+// so reconciliation logic can decide correctly.
 func (rep *Replicator) fetchFromPeer(peer *Node, key string) (*store.Value, error) {
+
 	url := fmt.Sprintf("http://%s/internal/fetch/%s", peer.Address, key)
+
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
 
@@ -322,7 +417,9 @@ func (rep *Replicator) fetchFromPeer(peer *Node, key string) (*store.Value, erro
 	return &val, nil
 }
 
-// peersOnly filters the replica list to exclude self.
+// peersOnly removes self from replica list.
+//
+// The coordinator already executed locally.
 func (rep *Replicator) peersOnly(nodes []*Node) []*Node {
 	var peers []*Node
 	for _, n := range nodes {
@@ -333,17 +430,26 @@ func (rep *Replicator) peersOnly(nodes []*Node) []*Node {
 	return peers
 }
 
-// DeleteReplicated replicates a delete (tombstone) to W nodes.
+// DeleteReplicated performs a quorum delete.
+//
+// Deletes are implemented using tombstones.
+// This prevents deleted data from reappearing
+// during reconciliation.
 func (rep *Replicator) DeleteReplicated(key string) error {
+
+	// Local delete first.
 	if err := rep.store.Delete(key); err != nil {
 		return err
 	}
-	val, _ := rep.store.GetRaw(key) // tombstone value
+
+	// Fetch tombstone value.
+	val, _ := rep.store.GetRaw(key)
 
 	replicas := rep.membership.ReplicaNodes(key, rep.N)
 	peers := rep.peersOnly(replicas)
 
 	var wg sync.WaitGroup
+
 	for _, peer := range peers {
 		wg.Add(1)
 		go func(p *Node) {
@@ -351,6 +457,7 @@ func (rep *Replicator) DeleteReplicated(key string) error {
 			_ = rep.sendReplicateRequest(p, key, val)
 		}(peer)
 	}
+
 	wg.Wait()
 	return nil
 }

@@ -1,4 +1,20 @@
-// Package api wires up the Gin HTTP router with all handler functions.
+// Big idea:
+// - This file is the "front door" of your distributed key-value store.
+//
+// Clients talk to:
+//   - PUT /kv/:key
+//   - GET /kv/:key
+//
+// Nodes talk to each other using:
+//
+//	/internal/*
+//
+// So this file separates:
+//  1. Public client API
+//  2. Cluster management API
+//  3. Internal node-to-node API
+//
+// Very important architectural separation.
 package api
 
 import (
@@ -9,7 +25,8 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
-// Handler holds all dependencies injected from main.
+// Handler contains everything this node needs
+// to serve HTTP requests.
 type Handler struct {
 	store      *store.Store
 	replicator *cluster.Replicator
