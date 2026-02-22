@@ -1,240 +1,174 @@
+// Package api wires up the Gin HTTP router with all handler functions.
 package api
 
 import (
 	"distributed-kvstore/internal/cluster"
 	"distributed-kvstore/internal/store"
 	"net/http"
-	"time"
 
 	"github.com/gin-gonic/gin"
 )
 
-type API struct {
-	node  *cluster.Node
-	store *store.Store
+// Handler holds all dependencies injected from main.
+type Handler struct {
+	store      *store.Store
+	replicator *cluster.Replicator
+	membership *cluster.Membership
+	selfID     string
 }
 
-func NewAPI(node *cluster.Node, store *store.Store) *API {
-	return &API{
-		node:  node,
-		store: store,
-	}
+// NewHandler creates a Handler.
+func NewHandler(s *store.Store, r *cluster.Replicator, m *cluster.Membership, selfID string) *Handler {
+	return &Handler{store: s, replicator: r, membership: m, selfID: selfID}
 }
 
-func (a *API) SetupRoutes(r *gin.Engine) {
-	// public API endpoints for client access
+// Register mounts all routes on r.
+func (h *Handler) Register(r *gin.Engine) {
+	// Public KV API — used by clients.
 	kv := r.Group("/kv")
-	{
-		kv.PUT("/:key", a.PutKey)
-		kv.GET("/:key", a.GetKey)
-		kv.DELETE("/:key", a.DeleteKey)
-	}
+	kv.GET("/:key", h.Get)
+	kv.PUT("/:key", h.Put)
+	kv.DELETE("/:key", h.Delete)
 
-	// internal API endpoints for inter-node communication and replication
+	// Cluster management.
+	clusterGroup := r.Group("/cluster")
+	clusterGroup.POST("/join", h.Join)
+	clusterGroup.POST("/leave", h.Leave)
+	clusterGroup.GET("/nodes", h.ListNodes)
+
+	// Internal endpoints used only by peer nodes.
 	internal := r.Group("/internal")
-	{
-		internal.PUT("/replicate", a.ReplicatePut)
-		internal.GET("/replicate/:key", a.ReplicateGet)
-		internal.DELETE("/replicate/:key", a.ReplicateDelete)
-	}
-
-	// cluster management endpoints
-	cluster := r.Group("/cluster")
-	{
-		cluster.POST("/join", a.JoinCluster)
-		cluster.GET("/status", a.ClusterStatus)
-		cluster.POST("/leave", a.LeaveCluster)
-	}
-
-	// adming and monitoring endpoints
-	admin := r.Group("/admin")
-	{
-		admin.GET("/shards", a.GetShards)
-		admin.GET("/replication", a.GetReplicationStatus)
-		admin.POST("/snapshot", a.CreateSnapshot)
-	}
+	internal.POST("/replicate", h.InternalReplicate)
+	internal.GET("/fetch/:key", h.InternalFetch)
 }
 
-// the req body format for the PUT /kv/:key endpoing
-type PUTrequest struct {
-	Value string `json:"value" binding:"required"`
-}
+// ─── Public KV handlers ───────────────────────────────────────────────────────
 
-func (a *API) PutKey(c *gin.Context) {
+// Put handles PUT /kv/:key
+// Body: {"value": "<string>"}
+func (h *Handler) Put(c *gin.Context) {
 	key := c.Param("key")
-	var req PUTrequest
 
-	if err := c.ShouldBindJSON(&req); err != nil {
+	var body struct {
+		Value string `json:"value" binding:"required"`
+	}
+	if err := c.ShouldBindJSON(&body); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
 
-	// calls the node's PUT method to handle the distributed write operation
-	if err := a.node.Put(key, req.Value); err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
-		return
-	}
-
-	c.JSON(http.StatusOK, gin.H{"status": "ok"})
-}
-
-func (a *API) GetKey(c *gin.Context) {
-	key := c.Param("key")
-
-	// calls the node's GET method to hander dist. read op
-	entry, err := a.node.Get(key)
+	val, err := h.replicator.ReplicateWrite(key, body.Value, nil)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
 
-	// checks if the key was found or marked as deleted
-	if entry == nil || entry.Deleted {
+	c.JSON(http.StatusOK, gin.H{
+		"key":   key,
+		"value": val.Data,
+		"clock": val.Clock,
+	})
+}
+
+// Get handles GET /kv/:key
+func (h *Handler) Get(c *gin.Context) {
+	key := c.Param("key")
+
+	val, err := h.replicator.CoordinateRead(key)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	if val == nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "key not found"})
 		return
 	}
 
 	c.JSON(http.StatusOK, gin.H{
-		"value":   entry.Value,
-		"version": entry.Version,
+		"key":        key,
+		"value":      val.Data,
+		"clock":      val.Clock,
+		"updated_at": val.UpdatedAt,
 	})
 }
 
-func (a *API) DeleteKey(c *gin.Context) {
+// Delete handles DELETE /kv/:key
+func (h *Handler) Delete(c *gin.Context) {
 	key := c.Param("key")
 
-	if err := a.node.Delete(key); err != nil {
+	if err := h.replicator.DeleteReplicated(key); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
-
-	c.JSON(http.StatusOK, gin.H{"status": "deleted"})
+	c.JSON(http.StatusOK, gin.H{"deleted": key})
 }
 
-// internal endpoint for a node to replicate a write operation
-func (a *API) ReplicatePut(c *gin.Context) {
-	var req cluster.QuorumRequest
+// ─── Cluster management handlers ─────────────────────────────────────────────
+
+// Join handles POST /cluster/join
+// Body: {"id": "<nodeID>", "address": "<host:port>"}
+func (h *Handler) Join(c *gin.Context) {
+	var node cluster.Node
+	if err := c.ShouldBindJSON(&node); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	if err := h.membership.Join(node); err != nil {
+		c.JSON(http.StatusConflict, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"joined": node.ID})
+}
+
+// Leave handles POST /cluster/leave
+// Body: {"id": "<nodeID>"}
+func (h *Handler) Leave(c *gin.Context) {
+	var body struct {
+		ID string `json:"id" binding:"required"`
+	}
+	if err := c.ShouldBindJSON(&body); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	if err := h.membership.Leave(body.ID); err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"left": body.ID})
+}
+
+// ListNodes handles GET /cluster/nodes
+func (h *Handler) ListNodes(c *gin.Context) {
+	c.JSON(http.StatusOK, gin.H{"nodes": h.membership.All()})
+}
+
+// ─── Internal (peer-to-peer) handlers ────────────────────────────────────────
+
+// InternalReplicate handles POST /internal/replicate
+// Accepts a value from a peer and applies it using vector-clock conflict resolution.
+func (h *Handler) InternalReplicate(c *gin.Context) {
+	var req cluster.ReplicateRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
 
-	// directly calls the local store's PUT method
-	err := a.store.Put(req.Key, req.Value, req.Version)
-	success := err == nil
-
-	c.JSON(http.StatusOK, cluster.QuorumResponse{
-		Success: success,
-		Error: func() string {
-			if err != nil {
-				return err.Error()
-			}
-			return ""
-		}(),
-	})
-}
-
-// internal endpoint for a node to replicate a read op
-func (a *API) ReplicateGet(c *gin.Context) {
-	key := c.Param("key")
-
-	entry, exists := a.store.Get(key)
-	if !exists {
-		// if the key doesn't exist, responds with a failed QuorumResponse
-		c.JSON(http.StatusOK, cluster.QuorumResponse{Success: false})
-		return
-	}
-
-	c.JSON(http.StatusOK, cluster.QuorumResponse{
-		Success: true,
-		Value:   entry.Value,
-		Version: &entry.Version,
-	})
-}
-
-// internal endpoint for a node to replicate a delete op
-func (a *API) ReplicateDelete(c *gin.Context) {
-	key := c.Param("key")
-
-	err := a.store.Delete(key)
-	success := err == nil
-
-	c.JSON(http.StatusOK, cluster.QuorumResponse{
-		Success: success,
-		Error: func() string {
-			if err != nil {
-				return err.Error()
-			}
-			return ""
-		}(),
-	})
-}
-
-// cluster management handlers
-
-// handles a req from a new node to join the cluster
-// NOTE: the implementation here is a placeholder.
-// real world logic would involve adding the new node to the consistent hash ring
-// and potentially rebalancing data
-func (a *API) JoinCluster(c *gin.Context) {
-	var req struct {
-		NodeID  string `json:"node_id"`
-		Address string `json:"address"`
-	}
-
-	if err := c.ShouldBindJSON(&req); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
-		return
-	}
-
-	c.JSON(http.StatusOK, gin.H{"status": "joined"})
-}
-
-// provides a health check and metrics for the node.
-// NOTE: The node ID is hardcoded here and should be retrieved from the node's config.
-func (a *API) ClusterStatus(c *gin.Context) {
-	metrics := a.store.GetMetrics()
-
-	status := map[string]any{
-		"node_id":   "node-1", // placeholder
-		"status":    "healthy",
-		"reads":     metrics.Reads,
-		"writes":    metrics.Writes,
-		"deletes":   metrics.Deletes,
-		"timestamp": time.Now().Unix(),
-	}
-
-	c.JSON(http.StatusOK, status)
-}
-
-// handles a req for a node to leave
-// NOTE: again a placeholder
-// actual logic would involve removing teh node from the consistent hash
-// and migrating its data to other nodes
-func (a *API) LeaveCluster(c *gin.Context) {
-	c.JSON(http.StatusOK, gin.H{"status": "left"})
-}
-
-// Admin handlers
-
-// provides information about the data distribution.
-// NOTE: This is a placeholder and would require logic to show which keys map to which nodes.
-func (a *API) GetShards(c *gin.Context) {
-	c.JSON(http.StatusOK, gin.H{"shards": "implementation needed"})
-}
-
-// provides information about the replication state.
-// NOTE: This is a placeholder and would require logic to track replication progress
-func (a *API) GetReplicationStatus(c *gin.Context) {
-	c.JSON(http.StatusOK, gin.H{"replication": "implementation needed"})
-}
-
-// handles an admin req to create a snapshot of the local store
-func (a *API) CreateSnapshot(c *gin.Context) {
-	if err := a.store.Snapshot(); err != nil {
+	_, err := h.store.ApplyRemote(req.Key, req.Value)
+	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
+	c.Status(http.StatusNoContent)
+}
 
-	c.JSON(http.StatusOK, gin.H{"status": "snapshot created"})
+// InternalFetch handles GET /internal/fetch/:key
+// Returns the raw value (including tombstones) so peers can do read repair.
+func (h *Handler) InternalFetch(c *gin.Context) {
+	key := c.Param("key")
+	val, ok := h.store.GetRaw(key)
+	if !ok {
+		c.JSON(http.StatusNotFound, gin.H{"error": "not found"})
+		return
+	}
+	c.JSON(http.StatusOK, val)
 }

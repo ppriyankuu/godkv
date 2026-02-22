@@ -1,221 +1,274 @@
+// Package store implements the core storage engine: an in-memory key-value
+// store backed by a Write-Ahead Log (WAL) for crash safety and periodic
+// snapshots for fast recovery.
+//
+// How it works (interview-ready explanation):
+//
+//  1. All writes go to the WAL first (disk) before being applied in-memory.
+//     If the process crashes mid-write, on restart we replay the WAL to
+//     reconstruct state — this is the same technique used by PostgreSQL/MySQL.
+//
+//  2. Snapshots periodically capture the full in-memory state to disk so
+//     WAL replay starts from the snapshot, not from the beginning of time.
+//     Without snapshots the WAL would grow unbounded and recovery would be slow.
+//
+//  3. sync.RWMutex gives us concurrent reads (multiple goroutines can hold
+//     RLock simultaneously) while serialising writes (Lock is exclusive).
+//     This is the standard Go pattern for a read-heavy cache.
 package store
 
 import (
+	"encoding/json"
 	"fmt"
+	"os"
+	"path/filepath"
 	"sync"
 	"time"
 )
 
-// storage engine for a single node
-// define a 'store' that holds key-value data in memory.
-
-// to prevent data loss during program crashes,
-// 2 common db techniques are used:
-
-// Write-Ahead Log (WAL): every change (put, delete) is first written to a
-// log file on disk before it's applied to the in-memory map. if the server
-// restarts, it can "replay" this log to reconstruct its state
-
-// Snapshots: periodically the entire in-memory data is saved to a "snapshot" file.
-// on the next restart, the program can load the latest snapshot and then replay
-// only the WAL entires that occured after the snaptshot.
-
-// Version represents the data's version using a Vector Clock
-// and a physical timestamp.
-type Version struct {
-	Clock     map[string]int64 `json:"clock"`
-	Timestamp int64            `json:"timestamp"`
+// Value wraps a stored value with metadata needed for distributed consistency.
+type Value struct {
+	Data      string      `json:"data"`
+	Clock     VectorClock `json:"clock"`     // version vector for conflict detection
+	Tombstone bool        `json:"tombstone"` // soft-delete marker (needed so deletes replicate)
+	UpdatedAt time.Time   `json:"updated_at"`
 }
 
-// Entry is the atomic unit of storage.
-// the 'Deleted' field signifies deletion without removing the key
-// necessary for replicating deletes correctly
-type Entry struct {
-	Key     string  `json:"key"`
-	Value   string  `json:"value"`
-	Version Version `json:"version"`
-	Deleted bool    `json:"deleted"`
-}
-
-// Store is the main storage engine for a node
+// Store is the primary storage abstraction.  It is safe for concurrent use.
 type Store struct {
-	// in-memory map for fast O(1) key lookups
-	data map[string]*Entry
-	// for thread-safety
-	mu sync.RWMutex
-	// WAL struct
-	wal    *WAL
-	nodeID string
-	// Snapshot struct
-	snapMgr *SnapshotManager
-	// tracks operational counts
-	metrics *Metrics
+	mu      sync.RWMutex
+	data    map[string]Value
+	wal     *WAL
+	dataDir string
+	nodeID  string
 }
 
-type Metrics struct {
-	Reads   int64
-	Writes  int64
-	Deletes int64
-}
+// New opens (or creates) a store rooted at dataDir.
+// On first open it replays any existing WAL entries on top of the last snapshot.
+func New(dataDir, nodeID string) (*Store, error) {
+	if err := os.MkdirAll(dataDir, 0755); err != nil {
+		return nil, fmt.Errorf("create data dir: %w", err)
+	}
 
-// NewStore initializes the store
-// the startup process:
-// 1. initialize WAL and Snapshot manager
-// 2. load the most recent snapshot into memory
-// 3. replay the WAL to apply any changes made after the snapshot was taken
-func NewStore(nodeId string, walPath string) (*Store, error) {
-	wal, err := NewWAL(walPath)
+	s := &Store{
+		data:    make(map[string]Value),
+		dataDir: dataDir,
+		nodeID:  nodeID,
+	}
+
+	// Step 1: load snapshot (if any) into memory.
+	if err := s.loadSnapshot(); err != nil {
+		return nil, fmt.Errorf("load snapshot: %w", err)
+	}
+
+	// Step 2: open WAL and replay any entries written after the last snapshot.
+	wal, err := newWAL(filepath.Join(dataDir, "wal.log"))
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("open wal: %w", err)
+	}
+	s.wal = wal
+
+	if err := s.replayWAL(); err != nil {
+		return nil, fmt.Errorf("replay wal: %w", err)
 	}
 
-	snapMgr := NewSnapshotManager(fmt.Sprintf("%s.snapshot", walPath))
-
-	store := &Store{
-		data:    make(map[string]*Entry),
-		nodeID:  nodeId,
-		wal:     wal,
-		snapMgr: snapMgr,
-		metrics: &Metrics{},
-	}
-
-	// load the snapshort first
-	if err := store.loadSnapshot(); err != nil {
-		fmt.Printf("Failed to load snapshot: %v\n", err)
-	}
-
-	// replay WAL
-	if err := store.replayWAL(); err != nil {
-		return nil, fmt.Errorf("failed to replay WAL: %w", err)
-	}
-
-	return store, nil
+	return s, nil
 }
 
-// Put inserts or updates a key
-// follows the WAL-first principle
-// 1. acquire a write lock to ensure exclusive access
-// 2. write the new entry to the on-disk WAL
-// 3. only if the WAL write succeeds, update the in-memory map
-func (s *Store) Put(key, value string, version *Version) error {
+// ─── Public API ───────────────────────────────────────────────────────────────
+
+// Put stores a value.  The caller supplies a VectorClock; if nil a fresh one
+// is created stamped with nodeID.
+func (s *Store) Put(key, data string, clock VectorClock) (Value, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	if version == nil {
-		version = s.generateVersion()
+	if clock == nil {
+		clock = make(VectorClock)
+	}
+	clock.Increment(s.nodeID) // bump our own counter on every write
+
+	v := Value{
+		Data:      data,
+		Clock:     clock,
+		Tombstone: false,
+		UpdatedAt: time.Now().UTC(),
 	}
 
-	entry := &Entry{
-		Key:     key,
-		Value:   value,
-		Version: *version,
-		Deleted: false,
+	// WAL-first: persist before mutating memory.
+	entry := walEntry{Op: opPut, Key: key, Value: v}
+	if err := s.wal.append(entry); err != nil {
+		return Value{}, fmt.Errorf("wal append: %w", err)
 	}
 
-	// write to WAL first
-	if err := s.wal.Append(entry); err != nil {
-		return err
-	}
-
-	s.data[key] = entry
-	s.metrics.Writes++
-	return nil
+	s.data[key] = v
+	return v, nil
 }
 
-// Get retrives a key. It uses a read lock to allow concurrent reads
-// returns a value only if the key exists and its 'Deleted' flag is false
-func (s *Store) Get(key string) (*Entry, bool) {
+// Get returns the value for key.  Returns (Value{}, false) if not found or deleted.
+func (s *Store) Get(key string) (Value, bool) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
-	entry, exists := s.data[key]
-	if exists && !entry.Deleted {
-		s.metrics.Reads++
-		return entry, true
+	v, ok := s.data[key]
+	if !ok || v.Tombstone {
+		return Value{}, false
 	}
-
-	return nil, false
+	return v, true
 }
 
-// Delete performs a "soft-delete"
-// (only changes the flag to true, and clears the value)
-// the operation is also written to the WAL to ensure the deletion
-// is replicable
+// GetRaw returns the raw Value including tombstones — used internally for
+// replication and read repair so we can propagate deletes.
+func (s *Store) GetRaw(key string) (Value, bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	v, ok := s.data[key]
+	return v, ok
+}
+
+// Delete soft-deletes a key by writing a tombstone.  The tombstone is
+// replicated to followers so they also remove the key.
 func (s *Store) Delete(key string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	version := s.generateVersion()
-	entry := &Entry{
-		Key:     key,
-		Value:   "",
-		Version: *version,
-		Deleted: true,
+	existing, ok := s.data[key]
+	clock := make(VectorClock)
+	if ok {
+		clock = existing.Clock.Copy()
+	}
+	clock.Increment(s.nodeID)
+
+	v := Value{
+		Clock:     clock,
+		Tombstone: true,
+		UpdatedAt: time.Now().UTC(),
 	}
 
-	if err := s.wal.Append(entry); err != nil {
-		return err
+	entry := walEntry{Op: opDelete, Key: key, Value: v}
+	if err := s.wal.append(entry); err != nil {
+		return fmt.Errorf("wal append: %w", err)
 	}
 
-	s.data[key] = entry
-	s.metrics.Deletes++
+	s.data[key] = v
 	return nil
 }
 
-// generateVersion creates a version for a new write originating no this node
-// the verctor clock is initialized with only this node's ID and current timestamp
-func (s *Store) generateVersion() *Version {
-	return &Version{
-		Clock:     map[string]int64{s.nodeID: time.Now().UnixNano()},
-		Timestamp: time.Now().UnixNano(),
+// ApplyRemote applies a value received from a peer during replication.
+// It uses the vector clock to decide whether to accept or discard the update.
+// This is the core of "last-write-wins with vector clocks."
+func (s *Store) ApplyRemote(key string, incoming Value) (applied bool, err error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	existing, ok := s.data[key]
+	if ok {
+		rel := incoming.Clock.Compare(existing.Clock)
+		switch rel {
+		case ConcurrentClocks:
+			// True conflict: both clocks are incomparable.  We merge by taking
+			// the later wall-clock time as a tiebreaker — a pragmatic choice
+			// used by many real systems (Cassandra, Riak).  A production system
+			// could surface the conflict to the application instead.
+			if incoming.UpdatedAt.Before(existing.UpdatedAt) {
+				return false, nil // keep existing
+			}
+		case Before:
+			// Incoming is strictly older — discard it.
+			return false, nil
+			// After or Equal: incoming wins, fall through.
+		}
 	}
+
+	entry := walEntry{Op: opPut, Key: key, Value: incoming}
+	if err := s.wal.append(entry); err != nil {
+		return false, err
+	}
+	s.data[key] = incoming
+	return true, nil
 }
 
-// loadSnapshot deserializes the snapshot file and
-// populates the in-memory data map
-// this is called only during initialization, so no lock is required.
-func (s *Store) loadSnapshot() error {
-	entries, err := s.snapMgr.Load()
-	if err != nil {
-		return err
-	}
+// Keys returns a snapshot of all live (non-tombstoned) keys.
+func (s *Store) Keys() []string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 
-	for _, entry := range entries {
-		s.data[entry.Key] = entry
+	keys := make([]string, 0, len(s.data))
+	for k, v := range s.data {
+		if !v.Tombstone {
+			keys = append(keys, k)
+		}
 	}
-
-	return nil
+	return keys
 }
 
-// replayWAL iterates through records and applies them to the 'data' map
-// overwrites any older state loaded from a snapshot
-func (s *Store) replayWAL() error {
-	return s.wal.Replay(func(entry *Entry) {
-		s.data[entry.Key] = entry
-	})
-}
+// ─── Snapshot ─────────────────────────────────────────────────────────────────
 
-// Snapshot creates a point-in-time snapshot of the current data
-// it uses a read lock to prevent modification during the copy processes
-// and then writes the copied data to a snapshot file
+// Snapshot serialises the current in-memory state to disk and truncates the
+// WAL.  Call this periodically (e.g. every N writes or on a timer).
 func (s *Store) Snapshot() error {
 	s.mu.RLock()
-	entries := make([]*Entry, 0, len(s.data))
-	for _, entry := range s.data {
-		entries = append(entries, entry)
+	snapshot := make(map[string]Value, len(s.data))
+	for k, v := range s.data {
+		snapshot[k] = v
 	}
 	s.mu.RUnlock()
 
-	return s.snapMgr.Save(entries)
+	path := filepath.Join(s.dataDir, "snapshot.json")
+	tmp := path + ".tmp"
+
+	f, err := os.Create(tmp)
+	if err != nil {
+		return err
+	}
+	if err := json.NewEncoder(f).Encode(snapshot); err != nil {
+		f.Close()
+		return err
+	}
+	f.Close()
+
+	// Atomic rename: if we crash between Create and Rename the old snapshot
+	// is still valid.
+	if err := os.Rename(tmp, path); err != nil {
+		return err
+	}
+
+	// Truncate WAL — everything is now captured in the snapshot.
+	return s.wal.truncate()
 }
 
-// GetMetrics provide thread-safe access to the store's operational metrics
-func (s *Store) GetMetrics() *Metrics {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	return &Metrics{
-		Reads:   s.metrics.Reads,
-		Writes:  s.metrics.Writes,
-		Deletes: s.metrics.Deletes,
+func (s *Store) loadSnapshot() error {
+	path := filepath.Join(s.dataDir, "snapshot.json")
+	f, err := os.Open(path)
+	if os.IsNotExist(err) {
+		return nil // no snapshot yet — that's fine
 	}
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+
+	var snapshot map[string]Value
+	if err := json.NewDecoder(f).Decode(&snapshot); err != nil {
+		return err
+	}
+	s.data = snapshot
+	return nil
+}
+
+func (s *Store) replayWAL() error {
+	entries, err := s.wal.readAll()
+	if err != nil {
+		return err
+	}
+	for _, e := range entries {
+		// Apply directly without re-writing to WAL.
+		s.data[e.Key] = e.Value
+	}
+	return nil
+}
+
+// Close flushes everything and closes underlying files.
+func (s *Store) Close() error {
+	return s.wal.close()
 }

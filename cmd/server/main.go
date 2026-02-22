@@ -1,71 +1,155 @@
+// cmd/server is the main entrypoint for a KV store node.
+//
+// Configuration is entirely via flags/environment so a single binary can
+// serve any role in the cluster.
+//
+// Example — single node:
+//
+//	./server --id node1 --addr :8080 --data-dir /var/kvstore/node1
+//
+// Example — 3-node cluster:
+//
+//	./server --id node1 --addr :8080 --data-dir /tmp/n1 \
+//	         --peers node2=localhost:8081,node3=localhost:8082
+//	./server --id node2 --addr :8081 --data-dir /tmp/n2 \
+//	         --peers node1=localhost:8080,node3=localhost:8082
+//	./server --id node3 --addr :8082 --data-dir /tmp/n3 \
+//	         --peers node1=localhost:8080,node2=localhost:8081
 package main
 
 import (
+	"context"
 	"distributed-kvstore/internal/api"
 	"distributed-kvstore/internal/cluster"
 	"distributed-kvstore/internal/store"
-	"encoding/json"
 	"flag"
 	"fmt"
 	"log"
+	"net/http"
 	"os"
+	"os/signal"
+	"strings"
+	"syscall"
 	"time"
 
 	"github.com/gin-gonic/gin"
 )
 
 func main() {
-	configPath := flag.String("config", "config.json", "Path to configuration file")
+	// ── Flags ──────────────────────────────────────────────────────────────
+	nodeID := flag.String("id", "node1", "Unique node identifier")
+	addr := flag.String("addr", ":8080", "Listen address (host:port)")
+	dataDir := flag.String("data-dir", "/tmp/kvstore", "Directory for WAL and snapshots")
+	peersFlag := flag.String("peers", "", "Comma-separated list of peer nodes: id=host:port")
+	replicationN := flag.Int("n", 3, "Replication factor (N)")
+	writeQuorum := flag.Int("w", 2, "Write quorum (W)")
+	readQuorum := flag.Int("r", 2, "Read quorum (R)")
 	flag.Parse()
 
-	config, err := loadConfig(*configPath)
+	if *writeQuorum+*readQuorum <= *replicationN {
+		log.Fatalf("FATAL: W(%d) + R(%d) must be > N(%d) for strong consistency",
+			*writeQuorum, *readQuorum, *replicationN)
+	}
+
+	// ── Storage ────────────────────────────────────────────────────────────
+	nodeDataDir := fmt.Sprintf("%s/%s", *dataDir, *nodeID)
+	s, err := store.New(nodeDataDir, *nodeID)
 	if err != nil {
-		log.Fatalf("Failed to load config: %v", err)
+		log.Fatalf("open store: %v", err)
+	}
+	defer s.Close()
+
+	// ── Cluster membership ─────────────────────────────────────────────────
+	// Always add self to the membership list.
+	selfNode := cluster.Node{ID: *nodeID, Address: *addr}
+	nodes := []cluster.Node{selfNode}
+
+	if *peersFlag != "" {
+		for _, entry := range strings.Split(*peersFlag, ",") {
+			parts := strings.SplitN(entry, "=", 2)
+			if len(parts) != 2 {
+				log.Fatalf("invalid peer format %q: expected id=host:port", entry)
+			}
+			nodes = append(nodes, cluster.Node{ID: parts[0], Address: parts[1]})
+		}
 	}
 
-	// validate quorum settings
-	if config.ReadQuorum+config.WriteQuorum <= config.Replication {
-		log.Fatalf("Invalid quorum settings: R+W must be > N")
+	membership := cluster.NewMembership(nodes, 150)
+
+	// ── Replicator ─────────────────────────────────────────────────────────
+	// If there are fewer nodes than N, cap quorum to avoid deadlock.
+	n := min(*replicationN, membership.Ring().NodeCount())
+	w := min(*writeQuorum, n)
+	r := min(*readQuorum, n)
+	replicator := cluster.NewReplicator(*nodeID, membership, s, n, w, r)
+
+	// ── HTTP server ────────────────────────────────────────────────────────
+	gin.SetMode(gin.ReleaseMode)
+	router := gin.New()
+	router.Use(api.Logger(), api.Recovery())
+
+	handler := api.NewHandler(s, replicator, membership, *nodeID)
+	handler.Register(router)
+
+	// Health check endpoint — useful for load balancers and readiness probes.
+	router.GET("/health", func(c *gin.Context) {
+		c.JSON(http.StatusOK, gin.H{
+			"node":   *nodeID,
+			"status": "ok",
+			"nodes":  membership.Ring().NodeCount(),
+		})
+	})
+
+	srv := &http.Server{
+		Addr:         *addr,
+		Handler:      router,
+		ReadTimeout:  10 * time.Second,
+		WriteTimeout: 10 * time.Second,
 	}
 
-	// store initialization
-	walPath := fmt.Sprintf("node_%s.wal", config.NodeID)
-	kvstore, err := store.NewStore(config.NodeID, walPath)
-	if err != nil {
-		log.Fatalf("failed to create store: %v", err)
-	}
-
-	// cluster node initialization
-	node := cluster.NewNode(config, kvstore)
-
-	r := gin.Default()
-
-	apiHandler := api.NewAPI(node, kvstore)
-	apiHandler.SetupRoutes(r)
-
+	// ── Graceful shutdown ──────────────────────────────────────────────────
+	// Listen for SIGINT/SIGTERM and give in-flight requests 15s to complete.
 	go func() {
-		ticker := time.NewTicker(5 * time.Minute)
-		defer ticker.Stop()
+		log.Printf("Node %s listening on %s (N=%d W=%d R=%d)", *nodeID, *addr, n, w, r)
+		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			log.Fatalf("server error: %v", err)
+		}
+	}()
 
+	// Background snapshot every 60 seconds.
+	go func() {
+		ticker := time.NewTicker(60 * time.Second)
+		defer ticker.Stop()
 		for range ticker.C {
-			if err := kvstore.Snapshot(); err != nil {
-				log.Printf("failed to create snapshot: %v", err)
+			if err := s.Snapshot(); err != nil {
+				log.Printf("snapshot error: %v", err)
+			} else {
+				log.Printf("snapshot saved")
 			}
 		}
 	}()
 
-	log.Printf("starting kv store on %s", config.Address)
-	log.Fatal(r.Run(config.Address))
-}
+	quit := make(chan os.Signal, 1)
+	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
+	<-quit
 
-func loadConfig(path string) (*cluster.Config, error) {
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return nil, err
+	log.Println("Shutting down node", *nodeID)
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	// Take a final snapshot before exiting.
+	if err := s.Snapshot(); err != nil {
+		log.Printf("final snapshot error: %v", err)
 	}
 
-	var config cluster.Config
+	if err := srv.Shutdown(ctx); err != nil {
+		log.Printf("server shutdown error: %v", err)
+	}
+}
 
-	err = json.Unmarshal(data, &config)
-	return &config, err
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
 }
